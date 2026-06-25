@@ -7,6 +7,7 @@ package tracing
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -39,6 +40,7 @@ import (
 	"github.com/cilium/tetragon/pkg/logger/logfields"
 	"github.com/cilium/tetragon/pkg/observer"
 	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyfilter"
 	"github.com/cilium/tetragon/pkg/selectors"
 	"github.com/cilium/tetragon/pkg/sensors"
 	"github.com/cilium/tetragon/pkg/sensors/base"
@@ -60,9 +62,13 @@ type uprobeLoadArgs struct {
 }
 
 type genericUprobe struct {
-	loadArgs     uprobeLoadArgs
-	tableId      idtable.EntryID
-	path         string
+	loadArgs uprobeLoadArgs
+	tableId  idtable.EntryID
+	// path is the binary path reported in events.
+	path string
+	// attachPath, when set, overrides the path used for ELF parsing and BPF
+	// attach; events still report path. Empty means path is used for both.
+	attachPath   string
 	symbol       string
 	address      uint64
 	refCtrOffset uint64
@@ -96,6 +102,11 @@ func populateUprobeRegs(m *ebpf.Map, regs []processapi.RegAssignment) error {
 
 func (g *genericUprobe) SetID(id idtable.EntryID) {
 	g.tableId = id
+}
+
+// attach returns attachPath if set, otherwise path.
+func (g *genericUprobe) attach() string {
+	return cmp.Or(g.attachPath, g.path)
 }
 
 func (g *genericUprobe) LogAttrs(level slog.Level, msg string, attrs ...slog.Attr) {
@@ -250,7 +261,7 @@ func loadSingleUprobeSensor(uprobeEntry *genericUprobe, args sensors.LoadProbeAr
 
 	symbol, offset := resolveSymbol(uprobeEntry.symbol)
 	attachData := &program.UprobeAttachData{
-		Path:         uprobeEntry.path,
+		Path:         uprobeEntry.attach(),
 		Symbol:       symbol,
 		Offset:       offset,
 		Address:      uprobeEntry.address,
@@ -365,7 +376,8 @@ func loadMultiUprobeSensor(ids []idtable.EntryID, args sensors.LoadProbeArgs) er
 
 		load.MapLoad = append(load.MapLoad, mapLoad...)
 
-		attach, ok := data.Attach[uprobeEntry.path]
+		attachKey := uprobeEntry.attach()
+		attach, ok := data.Attach[attachKey]
 		if !ok {
 			attach = &program.MultiUprobeAttachSymbolsCookies{}
 		}
@@ -384,7 +396,7 @@ func loadMultiUprobeSensor(ids []idtable.EntryID, args sensors.LoadProbeArgs) er
 
 		attach.Cookies = append(attach.Cookies, uint64(index))
 
-		data.Attach[uprobeEntry.path] = attach
+		data.Attach[attachKey] = attach
 	}
 
 	load.SetAttachData(data)
@@ -414,6 +426,10 @@ func (k *observerUprobeSensor) LoadProbe(args sensors.LoadProbeArgs) error {
 type addUprobeIn struct {
 	sensorPath string
 	policyName string
+	policyID   policyfilter.PolicyID
+	// attachPath overrides the attach/ELF-parse path; spec.Path is still
+	// reported in events. Set per-uprobe for resolvePathInContainer.
+	attachPath string
 	useMulti   bool
 	celExprs   *selectors.CelExprFunctions
 }
@@ -422,6 +438,17 @@ type uprobeHas struct {
 	sleepableOffload bool
 	sleepablePreload bool
 	substring        bool
+}
+
+// hasResolvePathInContainer reports whether any uprobe in the spec opts into
+// per-container path resolution.
+func hasResolvePathInContainer(spec *v1alpha1.TracingPolicySpec) bool {
+	for i := range spec.UProbes {
+		if spec.UProbes[i].ResolvePathInContainer {
+			return true
+		}
+	}
+	return false
 }
 
 // preValidateUprobes validates a uprobe policy spec before any sensor is
@@ -440,10 +467,15 @@ func preValidateUprobes(spec *v1alpha1.TracingPolicySpec) error {
 	return nil
 }
 
+// createGenericUprobeSensor builds the uprobe sensor for spec. attachPaths is an
+// optional per-uprobe attach-path override (keyed by uprobe index) used by
+// resolvePathInContainer child sensors; nil means no override. btfPath is always
+// resolved from the agent namespace (spec.BTFPath), not in-container.
 func createGenericUprobeSensor(
 	spec *v1alpha1.TracingPolicySpec,
 	name string,
 	polInfo *policyInfo,
+	attachPaths map[int]string,
 ) (*sensors.Sensor, error) {
 	var progs []*program.Program
 	var maps []*program.Map
@@ -465,42 +497,59 @@ func createGenericUprobeSensor(
 	in := addUprobeIn{
 		sensorPath: name,
 		policyName: polInfo.name,
+		policyID:   polInfo.policyID,
 
 		useMulti: useMulti,
 		celExprs: celExprs,
 	}
 
-	for _, uprobe := range spec.UProbes {
+	for i := range spec.UProbes {
+		uprobe := spec.UProbes[i]
+		// resolvePathInContainer uprobes are attached per-container by the
+		// reconciler, since Path lives inside the selected containers and
+		// opening it in the agent namespace here (addUprobe ->
+		// elf.OpenSafeELFFile) would fail. Skip them in the main sensor; the
+		// reconciler builds a child sensor per matching container (where they
+		// are cleared and carry per-uprobe attach overrides).
+		if uprobe.ResolvePathInContainer {
+			continue
+		}
 		if err = appendMacrosSelectors(uprobe.Selectors, spec.SelectorsMacros); err != nil {
 			return nil, fmt.Errorf("append macros selectors: %w", err)
 		}
 
+		in.attachPath = attachPaths[i]
 		ids, err = addUprobe(&uprobe, ids, &in, &has)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	if in.useMulti {
-		progs, maps, err = createMultiUprobeSensor(polInfo, name, ids, has)
-	} else {
-		progs, maps, err = createSingleUprobeSensor(polInfo, ids, has)
+	// A pure resolvePathInContainer policy has no main-sensor uprobes: it is a
+	// hook-only sensor that just carries the reconciler load/unload hooks set
+	// below. Only build programs and maps when there is at least one uprobe.
+	if len(ids) > 0 {
+		if in.useMulti {
+			progs, maps, err = createMultiUprobeSensor(polInfo, name, ids, has)
+		} else {
+			progs, maps, err = createSingleUprobeSensor(polInfo, ids, has)
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		maps = append(maps, program.MapUserFrom(base.ExecveMap))
+		if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
+			maps = append(maps, program.MapUserFrom(base.RingBufEvents))
+		}
+
+		if option.Config.ParentsMapEnabled {
+			maps = append(maps, program.MapUserFrom(base.ParentBinariesMap))
+		}
 	}
 
-	if err != nil {
-		return nil, err
-	}
-
-	maps = append(maps, program.MapUserFrom(base.ExecveMap))
-	if config.EnableV511Progs() && !option.Config.UsePerfRingBuffer {
-		maps = append(maps, program.MapUserFrom(base.RingBufEvents))
-	}
-
-	if option.Config.ParentsMapEnabled {
-		maps = append(maps, program.MapUserFrom(base.ParentBinariesMap))
-	}
-
-	return &sensors.Sensor{
+	sensor := &sensors.Sensor{
 		Name:      name,
 		Progs:     progs,
 		Maps:      maps,
@@ -527,8 +576,34 @@ func createGenericUprobeSensor(
 			}
 			return errs
 		},
-	}, nil
+	}
+
+	// If any uprobe opts into per-container path resolution, set up the
+	// reconciler that attaches the uprobe inside each matching container. The
+	// hook seam is only populated in non-nok8s builds (it needs the pod
+	// informer); in nok8s builds it is nil and resolvePathInContainer is a no-op
+	// beyond the load-time podSelector validation.
+	if resolvePathInContainerHook != nil && hasResolvePathInContainer(spec) {
+		postLoad, postUnload := resolvePathInContainerHook(spec, polInfo)
+		if postLoad != nil {
+			sensor.AddPostLoadHook(postLoad)
+		}
+		// Teardown is a PostUnloadHook (not a DestroyHook) so it runs when the
+		// policy is disabled (unload) as well as when it is deleted/destroyed;
+		// otherwise disabling a policy would leave the per-container child
+		// sensors attached.
+		if postUnload != nil {
+			sensor.AddPostUnloadHook(postUnload)
+		}
+	}
+
+	return sensor, nil
 }
+
+// resolvePathInContainerHook is a seam set by the non-nok8s build to wire up the
+// per-container uprobe reconciler. It returns a PostLoadHook (register +
+// snapshot existing containers) and a PostUnloadHook (unregister + detach all).
+var resolvePathInContainerHook func(spec *v1alpha1.TracingPolicySpec, polInfo *policyInfo) (postLoad, postUnload sensors.SensorHook)
 
 func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn, has *uprobeHas) ([]idtable.EntryID, error) {
 	var argRetprobe *v1alpha1.KProbeArg
@@ -804,6 +879,8 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		eventConfig.ArgIndex = argIdx
 		eventConfig.BTFArg = allBTFArgs
 		eventConfig.RegArg = regArg
+		// Scope events to the policy's pods via policyfilter (0 = no filtering).
+		eventConfig.PolicyID = uint32(in.policyID)
 
 		uprobeEntry := &genericUprobe{
 			loadArgs: uprobeLoadArgs{
@@ -816,6 +893,7 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 			},
 			tableId:           idtable.UninitializedEntryID,
 			path:              spec.Path,
+			attachPath:        in.attachPath,
 			symbol:            sym,
 			address:           offset,
 			refCtrOffset:      refCtrOffset,
@@ -841,7 +919,10 @@ func addUprobe(spec *v1alpha1.UProbeSpec, ids []idtable.EntryID, in *addUprobeIn
 		return nil
 	}
 
-	f, err := elf.OpenSafeELFFile(spec.Path)
+	// Parse the ELF from the attach path: the in-container Path is not visible
+	// in the agent's mount namespace.
+	elfPath := cmp.Or(in.attachPath, spec.Path)
+	f, err := elf.OpenSafeELFFile(elfPath)
 	if err != nil {
 		return nil, err
 	}
