@@ -894,8 +894,13 @@ func installTailCalls(bpfDir string, spec *ebpf.CollectionSpec, coll *ebpf.Colle
 	return nil
 }
 
+type rodataConfig struct {
+	IterNum uint8
+	Pad     [7]uint8
+}
+
 func initConfig(spec *ebpf.CollectionSpec) error {
-	v, ok := spec.Variables["CONFIG_ITER_NUM"]
+	v, ok := spec.Variables["rodata_config"]
 	if !ok {
 		return nil
 	}
@@ -903,8 +908,14 @@ func initConfig(spec *ebpf.CollectionSpec) error {
 	// We can't use numeric iterator until we get following fix from 6.9 kernel:
 	//   4f81c16f50ba bpf: Recognize that two registers are safe when their ranges match
 	// otherwise our loop code crosses 1mil instructions verifier limit.
-	enabled := bpf.HasKfunc("bpf_iter_num_new") && kernels.MinKernelVersion("6.9")
-	if err := v.Set(enabled); err != nil {
+	enabled := uint8(0)
+	if bpf.HasKfunc("bpf_iter_num_new") && kernels.MinKernelVersion("6.9") {
+		enabled = uint8(1)
+	}
+	data := rodataConfig{
+		IterNum: enabled,
+	}
+	if err := v.Set(data); err != nil {
 		return fmt.Errorf("failed  to set config variable '%s': %w", v, err)
 	}
 	return nil
